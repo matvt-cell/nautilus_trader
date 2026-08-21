@@ -128,18 +128,41 @@ impl KrakenSpotDataClient {
     pub fn new(client_id: ClientId, config: KrakenDataClientConfig) -> anyhow::Result<Self> {
         let cancellation_token = CancellationToken::new();
 
-        let http = KrakenSpotHttpClient::new(
-            config.environment,
-            config.base_url.clone(),
-            config.timeout_secs,
-            None,
-            None,
-            None,
-            config.proxy_url.clone(),
-            config
-                .max_requests_per_second
-                .unwrap_or(KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND),
-        )?;
+        let max_requests_per_second = config
+            .max_requests_per_second
+            .unwrap_or(KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND);
+
+        let http = match crate::common::credential::KrakenCredential::resolve_spot(
+            config.api_key.clone(),
+            config.api_secret.clone(),
+        ) {
+            Some(credential) => {
+                let (api_key, api_secret) = credential.into_parts();
+
+                KrakenSpotHttpClient::with_credentials(
+                    api_key,
+                    api_secret,
+                    config.environment,
+                    config.base_url.clone(),
+                    config.timeout_secs,
+                    None,
+                    None,
+                    None,
+                    config.proxy_url.clone(),
+                    max_requests_per_second,
+                )?
+            }
+            None => KrakenSpotHttpClient::new(
+                config.environment,
+                config.base_url.clone(),
+                config.timeout_secs,
+                None,
+                None,
+                None,
+                config.proxy_url.clone(),
+                max_requests_per_second,
+            )?,
+        };
 
         let ws = KrakenSpotWebSocketClient::new(
             config.clone(),

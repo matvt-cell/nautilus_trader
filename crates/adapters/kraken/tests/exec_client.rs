@@ -353,7 +353,46 @@ async fn handle_http_request(State(state): State<TestServerState>, req: Request)
                 ),
             }
         }
-        "/0/public/AssetPairs" => json_response(load_test_data("http_asset_pairs.json")),
+        "/0/public/AssetPairs" => {
+            let tokenized = req.uri().query().is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|part| part == "aclass_base=tokenized_asset")
+            });
+
+            let fixture = if tokenized {
+                "http_asset_pairs_tokenized.json"
+            } else {
+                "http_asset_pairs.json"
+            };
+
+            json_response(load_test_data(fixture))
+        }
+        "/0/private/TradeVolume" => json_response(
+            r#"{
+        "error": [],
+        "result": {
+            "fees": {
+                "XBTUSDT": {
+                    "fee": "0.8000"
+                },
+                "AAPLZUSD.EQ": {
+                    "fee": "0.6000"
+                }
+            },
+            "fees_maker": {
+                "XBTUSDT": {
+                    "fee": "0.4000"
+                },
+                "AAPLZUSD.EQ": {
+                    "fee": "0.3000"
+                }
+            }
+        }
+    }"#
+            .to_string(),
+        ),
+
         "/0/private/GetWebSocketsToken" => json_response(
             r#"{"error":[],"result":{"token":"TEST-TOKEN","expires":900}}"#.to_string(),
         ),

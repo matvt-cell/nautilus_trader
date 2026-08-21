@@ -1200,6 +1200,112 @@ impl KrakenSpotRawHttpClient {
         })
     }
 
+    /// Requests account trade volume and current fee rates (requires authentication).
+    pub async fn get_trade_volume(
+        &self,
+        params: &SpotTradeVolumeParams,
+    ) -> anyhow::Result<SpotTradeVolumeResponse, KrakenHttpError> {
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or(KrakenHttpError::MissingCredentials)?;
+
+        // Serialize authenticated requests so nonces reach Kraken in order.
+        let _guard = self.auth_mutex.lock().await;
+
+        let endpoint = "/0/private/TradeVolume";
+        let pair = params.pair.clone();
+        let cancellation_token = self.cancellation_token();
+
+        let operation = || {
+            let pair = pair.clone();
+            let cancellation_token = cancellation_token.clone();
+
+            async move {
+                // Generate a fresh nonce and signature for every retry attempt.
+                let nonce = self.generate_nonce();
+
+                let json_body = serde_json::json!({
+                    "nonce": nonce.to_string(),
+                    "pair": pair,
+                });
+
+                let json_str = serde_json::to_string(&json_body).map_err(|e| {
+                    KrakenHttpError::RequestNotStarted(format!(
+                        "Failed to serialize TradeVolume request: {e}"
+                    ))
+                })?;
+
+                let signature = credential
+                    .sign_spot_json(endpoint, nonce, &json_str)
+                    .map_err(|e| {
+                        KrakenHttpError::AuthenticationError(format!(
+                            "Failed to sign TradeVolume request: {e}"
+                        ))
+                    })?;
+
+                let mut headers = Self::default_headers();
+                headers.insert("API-Key".to_string(), credential.api_key().to_string());
+                headers.insert("API-Sign".to_string(), signature);
+                headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+                let response = self
+                    .send_order_request(
+                        Method::POST,
+                        endpoint,
+                        headers,
+                        Some(json_str.into_bytes()),
+                        &cancellation_token,
+                    )
+                    .await?;
+
+                if response.status.as_u16() >= 400 {
+                    let status = response.status.as_u16();
+                    let body = String::from_utf8_lossy(&response.body).to_string();
+
+                    if status == 401 || status == 403 {
+                        return Err(KrakenHttpError::AuthenticationError(format!(
+                            "HTTP error {status}: {body}"
+                        )));
+                    }
+
+                    return Err(KrakenHttpError::NetworkError(format!(
+                        "HTTP error {status}: {body}"
+                    )));
+                }
+
+                let parsed: KrakenResponse<SpotTradeVolumeResponse> =
+                    serde_json::from_slice(&response.body).map_err(|e| {
+                        KrakenHttpError::ParseError(format!(
+                            "Failed to parse TradeVolume response: {e}"
+                        ))
+                    })?;
+
+                if !parsed.error.is_empty() {
+                    return Err(KrakenHttpError::ApiError(parsed.error));
+                }
+
+                parsed.result.ok_or_else(|| {
+                    KrakenHttpError::ParseError(
+                        "Missing result in TradeVolume response".to_string(),
+                    )
+                })
+            }
+        };
+
+        let should_retry = kraken_http_should_retry;
+        let create_error = |error: RetryError| KrakenHttpError::NetworkError(error.to_string());
+
+        self.retry_manager
+            .execute_with_retry_with_cancel(
+                endpoint,
+                operation,
+                should_retry,
+                create_error,
+                &cancellation_token,
+            )
+            .await
+    }
     /// Requests open spot margin positions (requires authentication).
     pub async fn get_open_positions(
         &self,
@@ -1487,11 +1593,63 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<Vec<InstrumentAny>, KrakenHttpError> {
         let ts_init = self.generate_ts_init();
         let asset_pairs = self.inner.get_asset_pairs(pairs.clone(), None).await?;
+        let fee_overrides = {
+            let pair_names = asset_pairs.keys().cloned().collect::<Vec<_>>().join(",");
 
+            if pair_names.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let params = SpotTradeVolumeParams {
+                    pair: SpotTradeVolumePair::PairNames(pair_names),
+                };
+
+                match self.inner.get_trade_volume(&params).await {
+                    Ok(trade_volume) => {
+                        let mut overrides = std::collections::HashMap::new();
+
+                        for pair_name in asset_pairs.keys() {
+                            let taker = trade_volume.fees.get(pair_name).ok_or_else(|| {
+                                KrakenHttpError::ParseError(format!(
+                                    "TradeVolume response missing taker fee for {pair_name}"
+                                ))
+                            })?;
+
+                            let maker = trade_volume.fees_maker.get(pair_name).unwrap_or(taker);
+
+                            let maker_fee =
+                                crate::common::parse::parse_decimal(&maker.fee).map_err(|e| {
+                                    KrakenHttpError::ParseError(format!(
+                                        "Failed to parse TradeVolume maker fee for {pair_name}: {e}"
+                                    ))
+                                })? / rust_decimal::Decimal::from(100u32);
+
+                            let taker_fee =
+                                crate::common::parse::parse_decimal(&taker.fee).map_err(|e| {
+                                    KrakenHttpError::ParseError(format!(
+                                        "Failed to parse TradeVolume taker fee for {pair_name}: {e}"
+                                    ))
+                                })? / rust_decimal::Decimal::from(100u32);
+
+                            overrides.insert(pair_name.clone(), (maker_fee, taker_fee));
+                        }
+
+                        overrides
+                    }
+                    Err(KrakenHttpError::MissingCredentials) => std::collections::HashMap::new(),
+                    Err(e) => return Err(e),
+                }
+            }
+        };
         let mut instruments: Vec<InstrumentAny> = asset_pairs
             .iter()
             .filter_map(|(pair_name, definition)| {
-                match parse_spot_instrument(pair_name, definition, ts_init, ts_init) {
+                match parse_spot_instrument(
+                    pair_name,
+                    definition,
+                    fee_overrides.get(pair_name).copied(),
+                    ts_init,
+                    ts_init,
+                ) {
                     Ok(instrument) => Some((instrument, definition)),
                     Err(e) => {
                         log::warn!("Failed to parse instrument {pair_name}: {e}");
@@ -1525,11 +1683,98 @@ impl KrakenSpotHttpClient {
                     if !tokenized_pairs.is_empty() {
                         log::debug!("Fetched {} tokenized asset pairs", tokenized_pairs.len());
                     }
+                    let tokenized_fee_overrides = if tokenized_pairs.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        let mut pairs_with_class = Vec::new();
+                        let mut fee_key_by_pair = std::collections::HashMap::new();
+                        let mut seen_request_assets = std::collections::HashSet::new();
+
+                        for (pair_name, definition) in &tokenized_pairs {
+                            let wsname = definition.wsname.as_ref().ok_or_else(|| {
+                                KrakenHttpError::ParseError(format!(
+                                    "Tokenized AssetPairs definition missing wsname for {pair_name}"
+                                ))
+                            })?;
+
+                            let (ws_base, ws_quote) = wsname.as_str().split_once('/').ok_or_else(|| {
+        KrakenHttpError::ParseError(format!(
+            "Invalid tokenized AssetPairs wsname {wsname} for {pair_name}"
+        ))
+    })?;
+
+                            let underlying = ws_base.strip_suffix('x').ok_or_else(|| {
+        KrakenHttpError::ParseError(format!(
+            "Tokenized AssetPairs wsname base {ws_base} missing x suffix for {pair_name}"
+        ))
+    })?;
+
+                            let request_asset = format!("{underlying}/{ws_quote}");
+                            let fee_key = format!("{underlying}{}.EQ", definition.quote.as_str());
+
+                            fee_key_by_pair.insert(pair_name.clone(), fee_key);
+
+                            if seen_request_assets.insert(request_asset.clone()) {
+                                pairs_with_class.push(SpotTradeVolumePairWithClass {
+                                    asset: request_asset,
+                                    aclass: "equity_pair".to_string(),
+                                });
+                            }
+                        }
+
+                        let params = SpotTradeVolumeParams {
+                            pair: SpotTradeVolumePair::PairsWithClass(pairs_with_class),
+                        };
+
+                        match self.inner.get_trade_volume(&params).await {
+                            Ok(trade_volume) => {
+                                let mut overrides = std::collections::HashMap::new();
+
+                                for (pair_name, fee_key) in &fee_key_by_pair {
+                                    let taker = trade_volume.fees.get(fee_key).ok_or_else(|| {
+        KrakenHttpError::ParseError(format!(
+            "TradeVolume response missing taker fee for tokenized pair {pair_name} \
+             (canonical key {fee_key})"
+        ))
+    })?;
+
+                                    let maker =
+                                        trade_volume.fees_maker.get(fee_key).unwrap_or(taker);
+
+                                    let maker_fee =
+                    crate::common::parse::parse_decimal(&maker.fee).map_err(|e| {
+                        KrakenHttpError::ParseError(format!(
+                            "Failed to parse TradeVolume maker fee for {pair_name}: {e}"
+                        ))
+                    })? / Decimal::from(100);
+
+                                    let taker_fee =
+                    crate::common::parse::parse_decimal(&taker.fee).map_err(|e| {
+                        KrakenHttpError::ParseError(format!(
+                            "Failed to parse TradeVolume taker fee for {pair_name}: {e}"
+                        ))
+                    })? / Decimal::from(100);
+
+                                    overrides.insert(pair_name.clone(), (maker_fee, taker_fee));
+                                }
+
+                                overrides
+                            }
+                            Err(KrakenHttpError::MissingCredentials) => {
+                                std::collections::HashMap::new()
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
                     let tokenized_instruments: Vec<InstrumentAny> =
                         tokenized_pairs
                             .iter()
                             .filter_map(|(pair_name, definition)| match parse_tokenized_instrument(
-                                pair_name, definition, ts_init, ts_init,
+                                pair_name,
+                                definition,
+                                tokenized_fee_overrides.get(pair_name).copied(),
+                                ts_init,
+                                ts_init,
                             ) {
                                 Ok(instrument) => Some(instrument),
                                 Err(e) => {
